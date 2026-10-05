@@ -1,0 +1,21 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env
+
+# ChromaDB local database
+chroma_db/
+
+# macOS
+.DS_Store
+
+# Node
+frontend/node_modules/
+frontend/dist/

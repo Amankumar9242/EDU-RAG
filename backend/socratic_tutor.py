@@ -10,12 +10,25 @@ The core Socratic reasoning engine. Wraps the Claude API with:
 """
 
 import os
+import sys
 import json
+from pathlib import Path
 from dataclasses import dataclass, field
-from anthropic import Anthropic
-from .retriever import Retriever
+from google import genai
 
-MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+sys.path.insert(0, str(Path(__file__).parent))
+
+try:
+    from retriever import Retriever
+except ImportError:
+    from .retriever import Retriever
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def get_model_name() -> str:
+    return os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 MAX_HINTS = int(os.getenv("MAX_HINTS_BEFORE_REVEAL", "4"))
 
 SOCRATIC_SYSTEM_PROMPT = """You are a patient, encouraging Socratic tutor.
@@ -53,7 +66,7 @@ context and a proposed tutor response, determine if the tutor response directly
 states the final answer, formula, or conclusion instead of guiding the student
 toward it themselves.
 
-Respond ONLY with JSON: {"leaks_answer": true | false, "reason": "<short reason>"}
+Respond ONLY with JSON: {{"leaks_answer": true | false, "reason": "<short reason>"}}
 
 Context:
 {context}
@@ -73,30 +86,52 @@ class TutorSession:
 
 class SocraticTutor:
     def __init__(self, api_key: str | None = None):
-        self.client = Anthropic(api_key=api_key) if api_key else Anthropic()
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        self._client = None
         self.retriever = Retriever()
 
-    def _call_claude(self, system: str, user_content: str) -> dict:
-        resp = self.client.messages.create(
-            model=MODEL,
-            max_tokens=500,
-            system=system,
-            messages=[{"role": "user", "content": user_content}],
+    def get_client(self):
+        if self._client is None:
+            key = self.api_key
+            if not key or key == "your_gemini_api_key_here":
+                raise ValueError("GEMINI_API_KEY is missing or set to placeholder. Please set your GEMINI_API_KEY in .env file.")
+            self._client = genai.Client(api_key=key)
+        return self._client
+
+    def _call_gemini(self, system: str, user_content: str) -> dict:
+        client = self.get_client()
+        model_name = get_model_name()
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=user_content,
+            config={"system_instruction": system, "max_output_tokens": 500},
         )
-        raw = "".join(
-            block.text for block in resp.content if getattr(block, "type", "") == "text"
-        )
-        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            # Fall back gracefully if the model doesn't return clean JSON
-            return {"response": raw, "student_status": "unclear", "is_final_answer_revealed": False}
+        raw = (resp.text or "").strip()
+
+        def _extract_text(text: str) -> dict:
+            cleaned = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            try:
+                parsed = json.loads(cleaned)
+                if isinstance(parsed, dict):
+                    if "response" in parsed and isinstance(parsed["response"], str):
+                        resp_str = parsed["response"].strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                        if resp_str.startswith("{") and "response" in resp_str:
+                            nested = _extract_text(resp_str)
+                            parsed["response"] = nested.get("response", resp_str)
+                    return parsed
+            except Exception:
+                pass
+            return {"response": cleaned, "student_status": "unclear", "is_final_answer_revealed": False}
+
+        return _extract_text(raw)
 
     def _check_leak(self, context: str, response: str) -> bool:
-        prompt = LEAK_CHECK_PROMPT.format(context=context, response=response)
-        result = self._call_claude(system="You are a strict JSON-only reviewer.", user_content=prompt)
-        return bool(result.get("leaks_answer", False))
+        try:
+            prompt = LEAK_CHECK_PROMPT.format(context=context, response=response)
+            result = self._call_gemini(system="You are a strict JSON-only reviewer.", user_content=prompt)
+            return bool(result.get("leaks_answer", False))
+        except Exception:
+            return False
 
     def ask(self, session: TutorSession, student_message: str) -> dict:
         """
@@ -128,8 +163,31 @@ Hints given so far: {session.hint_count} (max before reveal: {MAX_HINTS})
 {"The student has struggled long enough - you must now clearly explain the answer, citing the context, rather than asking another question." if force_reveal else ""}
 """
 
-        result = self._call_claude(SOCRATIC_SYSTEM_PROMPT, user_content)
+        try:
+            result = self._call_gemini(SOCRATIC_SYSTEM_PROMPT, user_content)
+        except Exception as e:
+            return {
+                "reply": f"⚠️ Gemini API Key Configuration Error: {str(e)}",
+                "sources": [c["source"] for c in retrieved],
+                "hint_count": session.hint_count,
+                "resolved": False,
+                "status": "error",
+            }
         reply = result.get("response", "").strip()
+        
+        def _clean_reply(r):
+            if isinstance(r, str):
+                s = r.strip()
+                if s.startswith("{") and "response" in s:
+                    try:
+                        parsed = json.loads(s)
+                        if isinstance(parsed, dict) and "response" in parsed:
+                            return _clean_reply(parsed["response"])
+                    except Exception:
+                        pass
+            return r
+
+        reply = _clean_reply(reply)
         status = result.get("student_status", "unclear")
         revealed = bool(result.get("is_final_answer_revealed", False)) or force_reveal
 
@@ -138,7 +196,7 @@ Hints given so far: {session.hint_count} (max before reveal: {MAX_HINTS})
             if self._check_leak(context_text, reply):
                 # Ask the model to try again, more conservatively
                 retry_content = user_content + "\n\nYour previous draft revealed the answer directly. Rewrite it as a guiding question instead, without stating the final result."
-                result = self._call_claude(SOCRATIC_SYSTEM_PROMPT, retry_content)
+                result = self._call_gemini(SOCRATIC_SYSTEM_PROMPT, retry_content)
                 reply = result.get("response", "").strip()
                 status = result.get("student_status", status)
                 revealed = bool(result.get("is_final_answer_revealed", False))

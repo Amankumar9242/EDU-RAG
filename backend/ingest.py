@@ -11,6 +11,7 @@ Run directly to (re)build the index from everything in the data/ folder:
 """
 
 import os
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 import re
 import glob
 import chromadb

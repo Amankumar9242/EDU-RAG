@@ -5,9 +5,19 @@ Thin wrapper around the Chroma collection for querying relevant chunks
 given a student's question.
 """
 
+import os
+import sys
+from pathlib import Path
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 import chromadb
 from chromadb.utils import embedding_functions
-from .ingest import DB_DIR, COLLECTION_NAME, EMBED_MODEL_NAME
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+try:
+    from ingest import DB_DIR, COLLECTION_NAME, EMBED_MODEL_NAME
+except ImportError:
+    from .ingest import DB_DIR, COLLECTION_NAME, EMBED_MODEL_NAME
 
 
 class Retriever:
